@@ -690,7 +690,7 @@ class RecallBricksMemory:
             query = self._sanitize_text(query)
         except Exception as e:
             logger.error(f"Failed to sanitize query: {e}")
-            return {"history": [] if self.return_messages else ""}
+            return {"history": []}
 
         # Track metrics
         with self._lock:
@@ -756,14 +756,14 @@ class RecallBricksMemory:
                         context_parts.append(text)
 
                 context = "\n\n".join(context_parts)
-                return {"history": context}
+                return {"history": [context] if context else []}
 
         except Exception as e:
             if self.enable_logging:
                 logger.error(f"Failed to load memory: {e}")
 
             # Return empty history on failure (graceful degradation)
-            return {"history": [] if self.return_messages else ""}
+            return {"history": []}
 
     def save_context(self, inputs: Dict[str, Any], outputs: Dict[str, str]) -> None:
         """
