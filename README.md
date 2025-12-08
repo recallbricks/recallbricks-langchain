@@ -26,8 +26,9 @@ from recallbricks_langchain import RecallBricksMemory
 
 # Initialize memory with RecallBricks
 memory = RecallBricksMemory(
+    agent_id="my-agent",
     api_key="your-recallbricks-api-key",
-    user_id="user-123"  # Optional: for multi-user apps
+    user_id="user-123"  # Optional
 )
 
 # Use with any LangChain chain
@@ -69,8 +70,9 @@ conversation.run("Why did the deployment fail?")
 
 ```python
 memory = RecallBricksMemory(
+    agent_id="my-agent",
     api_key="your-key",
-    user_id="user-123",
+    user_id="user-123",  # Optional
     limit=20,  # Number of memories to retrieve
     min_relevance=0.7,  # Minimum relevance score
     return_messages=True  # Return as Message objects
@@ -82,6 +84,7 @@ memory = RecallBricksMemory(
 ```python
 def get_conversation_for_user(user_id: str):
     memory = RecallBricksMemory(
+        agent_id="my-agent",
         api_key="your-key",
         user_id=user_id  # Isolates memory per user
     )

@@ -3,7 +3,14 @@
     "allow": [
       "Bash(echo:*)",
       "Bash(python:*)",
-      "Bash(tree:*)"
+      "Bash(tree:*)",
+      "Bash(set PYTHONIOENCODING=utf-8)",
+      "Bash(chcp 65001)",
+      "Bash(nul)",
+      "Bash(cat:*)",
+      "Bash(PYTHONIOENCODING=utf-8 python:*)",
+      "WebFetch(domain:pypi.org)",
+      "WebSearch"
     ],
     "deny": [],
     "ask": []

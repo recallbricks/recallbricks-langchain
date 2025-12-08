@@ -9,6 +9,9 @@ recallbricks_langchain.egg-info/dependency_links.txt
 recallbricks_langchain.egg-info/requires.txt
 recallbricks_langchain.egg-info/top_level.txt
 tests/__init__.py
+tests/breaking_tests.py
+tests/breaking_tests_fast.py
 tests/load_test.py
 tests/stress_test.py
+tests/test_bulletproof_features.py
 tests/test_memory.py
