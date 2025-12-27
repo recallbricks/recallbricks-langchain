@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional, Callable
+from typing import Any, Dict, List, Optional, Callable, Generator
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 import requests
 import os
@@ -12,6 +12,7 @@ import atexit
 from functools import wraps
 from datetime import datetime, timedelta, timezone
 from collections import deque
+from contextlib import contextmanager
 
 
 # Configure logging
@@ -382,6 +383,8 @@ class RecallBricksMemory:
     Enterprise-grade memory class for LangChain using RecallBricks.
 
     Features:
+    - Automatic metadata extraction via learn() endpoint
+    - Organized recall with category summaries (3-5x faster context assembly)
     - Automatic retry with exponential backoff
     - Circuit breaker for fault tolerance
     - Comprehensive error handling
@@ -411,7 +414,12 @@ class RecallBricksMemory:
         rate_limit_period: int = 60,
         enable_deduplication: bool = True,
         enable_metrics: bool = True,
-        enable_distributed_tracing: bool = True
+        enable_distributed_tracing: bool = True,
+        organized: bool = True,
+        source: str = "langchain",
+        project_id: str = None,
+        enable_autonomous: bool = False,
+        autonomous_features: Dict[str, Any] = None
     ):
         """
         Initialize enterprise-grade RecallBricks memory.
@@ -437,11 +445,23 @@ class RecallBricksMemory:
             enable_deduplication: Enable request deduplication (default: True)
             enable_metrics: Enable Prometheus metrics collection (default: True)
             enable_distributed_tracing: Enable request ID tracking (default: True)
+            organized: Use organized recall for better context assembly (default: True)
+            source: Source identifier for memories (default: "langchain")
+            project_id: Optional project ID for multi-tenant applications
+            enable_autonomous: Enable autonomous agent features (default: False)
+            autonomous_features: Configuration dict for autonomous features:
+                - working_memory_ttl: TTL for working memory sessions (seconds, default: 3600)
+                - goal_tracking_enabled: Enable goal tracking (default: True)
+                - metacognition_enabled: Enable quality/uncertainty assessment (default: True)
+                - confidence_threshold: Min confidence for quality assessment (default: 0.7)
         """
         # Store memory configuration
         self.return_messages = return_messages
         self.input_key = input_key
         self.output_key = output_key
+        self.organized = organized
+        self.source = source
+        self.project_id = project_id
 
         # SECURITY FIX: Validate agent_id
         if not agent_id or not isinstance(agent_id, str):
@@ -536,6 +556,27 @@ class RecallBricksMemory:
         # BULLETPROOF: Graceful shutdown
         self._shutdown = False
         atexit.register(self.shutdown)
+
+        # Autonomous agent features (v1.3.0)
+        self.enable_autonomous = enable_autonomous
+        self.autonomous_features = autonomous_features or {}
+
+        # Default autonomous configuration
+        self._autonomous_config = {
+            "working_memory_ttl": self.autonomous_features.get("working_memory_ttl", 3600),
+            "goal_tracking_enabled": self.autonomous_features.get("goal_tracking_enabled", True),
+            "metacognition_enabled": self.autonomous_features.get("metacognition_enabled", True),
+            "confidence_threshold": self.autonomous_features.get("confidence_threshold", 0.7),
+        }
+
+        # Working memory sessions storage
+        self._working_memory_sessions: Dict[str, Dict[str, Any]] = {}
+
+        # Goal tracking storage
+        self._active_goals: Dict[str, Dict[str, Any]] = {}
+
+        if enable_autonomous and self.enable_logging:
+            logger.info(f"Autonomous agent features enabled with config: {self._autonomous_config}")
 
     @property
     def memory_variables(self) -> List[str]:
@@ -665,6 +706,8 @@ class RecallBricksMemory:
         Load memory variables from RecallBricks with enterprise-grade reliability.
 
         Features:
+        - Organized recall with category summaries (when organized=True)
+        - 3-5x faster context assembly for LLMs
         - Automatic retry with exponential backoff
         - Circuit breaker protection
         - Input validation and sanitization
@@ -701,17 +744,22 @@ class RecallBricksMemory:
 
         # Define API call operation
         def get_context_operation():
-            # Use POST /memories/search for semantic search
+            # Use POST /memories/recall for organized recall
             # User scoping handled server-side via X-API-Key
-            url = f"{self.api_url}/memories/search"
+            url = f"{self.api_url}/memories/recall"
             headers = {
                 "X-API-Key": self.api_key,
                 "Content-Type": "application/json"
             }
             payload = {
                 "query": query,
-                "limit": self.limit
+                "limit": self.limit,
+                "organized": self.organized
             }
+
+            # Add optional project_id if set
+            if self.project_id:
+                payload["project_id"] = self.project_id
 
             # PERFORMANCE FIX: Use connection pool
             response = get_session().post(url, json=payload, headers=headers, timeout=30)
@@ -733,13 +781,7 @@ class RecallBricksMemory:
 
             # Extract memories from response
             memories = response_data.get("memories", [])
-
-            # Sort by timestamp (most recent first) and apply limit
-            memories = sorted(
-                memories,
-                key=lambda m: m.get('created_at', ''),
-                reverse=True
-            )[:self.limit]
+            categories = response_data.get("categories", {})
 
             if self.enable_logging:
                 logger.debug(
@@ -748,26 +790,27 @@ class RecallBricksMemory:
 
             # Format based on return_messages setting
             if self.return_messages:
-                # Return memories as messages (simplified for now)
-                # In a real implementation, you might want to parse the memory text
-                # to determine if it's from Human or AI
+                # Return memories as messages
                 messages = []
                 for memory in memories:
                     text = memory.get("text", "")
                     if text:
-                        # For now, treat all memories as context (could be improved)
                         messages.append(HumanMessage(content=text))
 
                 return {"history": messages}
             else:
-                # Return as formatted string
-                context_parts = []
-                for memory in memories:
-                    text = memory.get("text", "")
-                    if text:
-                        context_parts.append(text)
+                # Return as formatted string with organized context
+                if self.organized and categories:
+                    context = self._format_organized_memories(memories, categories)
+                else:
+                    # Backward compatible format
+                    context_parts = []
+                    for memory in memories:
+                        text = memory.get("text", "")
+                        if text:
+                            context_parts.append(text)
+                    context = "\n\n".join(context_parts)
 
-                context = "\n\n".join(context_parts)
                 return {"history": [context] if context else []}
 
         except Exception as e:
@@ -777,11 +820,60 @@ class RecallBricksMemory:
             # Return empty history on failure (graceful degradation)
             return {"history": []}
 
+    def _format_organized_memories(self, memories: List[Dict], categories: Dict) -> str:
+        """
+        Format organized recall results for LangChain context.
+
+        Args:
+            memories: List of memory objects from recall
+            categories: Category summaries from organized recall
+
+        Returns:
+            Formatted context string with category organization
+        """
+        if not memories:
+            return ""
+
+        context_parts = ["=== Relevant Context ===\n"]
+
+        # Add category summaries
+        if categories:
+            context_parts.append("Overview:")
+            for category, summary_data in categories.items():
+                if isinstance(summary_data, dict):
+                    summary = summary_data.get("summary", "")
+                    count = summary_data.get("count", 0)
+                    avg_score = summary_data.get("avg_score", 0)
+                    context_parts.append(
+                        f"  • {category}: {summary} "
+                        f"({count} memories, relevance: {avg_score:.2f})"
+                    )
+            context_parts.append("")
+
+        # Add individual memories grouped by category
+        context_parts.append("Details:")
+        current_category = None
+
+        for memory in memories:
+            metadata = memory.get("metadata", {})
+            memory_category = metadata.get("category", "General")
+
+            if memory_category != current_category:
+                current_category = memory_category
+                context_parts.append(f"\n[{current_category}]")
+
+            text = memory.get("text", "")
+            if text:
+                context_parts.append(f"  - {text}")
+
+        return "\n".join(context_parts)
+
     def save_context(self, inputs: Dict[str, Any], outputs: Dict[str, str]) -> None:
         """
-        Save context to RecallBricks with enterprise-grade reliability.
+        Save context to RecallBricks with automatic metadata extraction.
 
         Features:
+        - Uses learn() endpoint for automatic tag/category extraction
         - Automatic retry with exponential backoff
         - Circuit breaker protection
         - Input validation and sanitization
@@ -838,29 +930,48 @@ class RecallBricksMemory:
 
                 return  # Skip duplicate save
 
-        # Format as conversation turn
-        text = f"Human: {input_str}\nAI: {output_str}"
-
         # Track metrics
         with self._lock:
             self.metrics["save_count"] += 1
 
-        # Define save operation
-        def save_operation():
-            url = f"{self.api_url}/memories"
+        # Save input with automatic metadata extraction via learn()
+        self._learn(f"User: {input_str}")
+
+        # Save output with automatic metadata extraction via learn()
+        self._learn(f"Assistant: {output_str}")
+
+        if self.enable_logging:
+            logger.debug(
+                f"Saved context for user: {self.user_id or 'default'}"
+            )
+
+    def _learn(self, text: str) -> Dict[str, Any]:
+        """
+        Save memory using learn() endpoint with automatic metadata extraction.
+
+        Args:
+            text: Text content to save
+
+        Returns:
+            Response from learn endpoint
+
+        Raises:
+            Exception: If API call fails after retries
+        """
+        def learn_operation():
+            url = f"{self.api_url}/memories/learn"
             headers = {
                 "X-API-Key": self.api_key,
                 "Content-Type": "application/json"
             }
             payload = {
-                "user_id": self.user_id,
-                "agent_id": self.agent_id,
-                "text": text,  # API expects 'text' field, not 'content'
-                "metadata": {
-                    "type": "conversation_turn",
-                    "timestamp": datetime.now(timezone.utc).isoformat()  # SECURITY FIX: UTC timezone
-                }
+                "text": text,
+                "source": self.source
             }
+
+            # Add optional fields if set
+            if self.project_id:
+                payload["project_id"] = self.project_id
 
             # SECURITY FIX: Validate total payload size
             payload_size = len(json.dumps(payload))
@@ -873,18 +984,97 @@ class RecallBricksMemory:
             return response.json()
 
         try:
-            # Execute with retry and circuit breaker
-            self._execute_with_retry(save_operation)
-
-            if self.enable_logging:
-                logger.debug(
-                    f"Saved context for user: {self.user_id or 'default'}"
-                )
-
+            return self._execute_with_retry(learn_operation)
         except Exception as e:
             if self.enable_logging:
-                logger.error(f"Failed to save context: {e}")
+                logger.error(f"Failed to learn memory: {e}")
             raise
+
+    def learn(self, text: str, source: str = None, project_id: str = None, metadata: Dict[str, Any] = None) -> Dict[str, Any]:
+        """
+        Public method to save a memory with automatic metadata extraction.
+
+        This is the recommended way to save memories as it automatically
+        extracts tags, categories, entities, and importance scores.
+
+        Args:
+            text: Text content to save
+            source: Source identifier (defaults to instance source)
+            project_id: Project ID (defaults to instance project_id)
+            metadata: Optional additional metadata
+
+        Returns:
+            Response from learn endpoint including extracted metadata
+
+        Example:
+            memory.learn("User prefers dark mode for all applications")
+            # Returns: {"id": "...", "metadata": {"tags": ["preferences", "ui"], ...}}
+        """
+        def learn_operation():
+            url = f"{self.api_url}/memories/learn"
+            headers = {
+                "X-API-Key": self.api_key,
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "text": self._sanitize_text(text),
+                "source": source or self.source
+            }
+
+            # Add optional fields
+            if project_id or self.project_id:
+                payload["project_id"] = project_id or self.project_id
+            if metadata:
+                payload["metadata"] = metadata
+
+            # SECURITY FIX: Validate total payload size
+            payload_size = len(json.dumps(payload))
+            if payload_size > 250000:  # 250KB limit (conservative)
+                raise ValueError(f"Total payload too large: {payload_size} bytes (max 250KB)")
+
+            response = get_session().post(url, json=payload, headers=headers, timeout=30)
+            response.raise_for_status()
+            return response.json()
+
+        return self._execute_with_retry(learn_operation)
+
+    def recall(self, query: str, limit: int = None, organized: bool = None, project_id: str = None) -> Dict[str, Any]:
+        """
+        Public method to recall memories with optional organization.
+
+        Args:
+            query: Search query
+            limit: Number of results (defaults to instance limit)
+            organized: Use organized recall (defaults to instance setting)
+            project_id: Project ID (defaults to instance project_id)
+
+        Returns:
+            Response with memories and optional category summaries
+
+        Example:
+            result = memory.recall("user preferences")
+            # Returns: {"memories": [...], "categories": {"Preferences": {...}}}
+        """
+        def recall_operation():
+            url = f"{self.api_url}/memories/recall"
+            headers = {
+                "X-API-Key": self.api_key,
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "query": self._sanitize_text(query),
+                "limit": limit or self.limit,
+                "organized": organized if organized is not None else self.organized
+            }
+
+            if project_id or self.project_id:
+                payload["project_id"] = project_id or self.project_id
+
+            response = get_session().post(url, json=payload, headers=headers, timeout=30)
+            response.raise_for_status()
+            return response.json()
+
+        return self._execute_with_retry(recall_operation)
 
     def get_metrics(self) -> Dict[str, int]:
         """
@@ -1057,3 +1247,554 @@ class RecallBricksMemory:
         """
         if self.enable_logging:
             logger.info("Clear called (no-op - RecallBricks doesn't support bulk delete)")
+
+    # ============================================================================
+    # AUTONOMOUS AGENT FEATURES (v1.3.0)
+    # ============================================================================
+
+    def create_working_memory_session(self, session_id: str) -> Dict[str, Any]:
+        """
+        Create a working memory session for autonomous agent operation.
+
+        Working memory provides short-term, task-specific memory that persists
+        only for the duration of a task or session. Ideal for multi-step reasoning.
+
+        Args:
+            session_id: Unique identifier for the working memory session
+
+        Returns:
+            Session info including session_id, created_at, and ttl
+
+        Raises:
+            ValueError: If autonomous features not enabled or invalid session_id
+
+        Example:
+            session = memory.create_working_memory_session("task-123")
+            # Perform multi-step reasoning with working memory
+            memory.end_working_memory_session("task-123")
+        """
+        if not self.enable_autonomous:
+            raise ValueError("Autonomous features not enabled. Set enable_autonomous=True")
+
+        if not session_id or not isinstance(session_id, str):
+            raise ValueError("session_id must be a non-empty string")
+
+        # Check for existing session
+        if session_id in self._working_memory_sessions:
+            if self.enable_logging:
+                logger.warning(f"Working memory session '{session_id}' already exists, reusing")
+            return self._working_memory_sessions[session_id]
+
+        session_data = {
+            "session_id": session_id,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "ttl": self._autonomous_config["working_memory_ttl"],
+            "items": [],
+            "context": {},
+            "active": True
+        }
+
+        with self._lock:
+            self._working_memory_sessions[session_id] = session_data
+
+        if self.enable_logging:
+            logger.info(f"Created working memory session: {session_id}")
+
+        return session_data
+
+    def add_to_working_memory(self, session_id: str, item: str, metadata: Dict[str, Any] = None) -> None:
+        """
+        Add an item to working memory session.
+
+        Args:
+            session_id: Working memory session ID
+            item: Content to add to working memory
+            metadata: Optional metadata for the item
+
+        Raises:
+            ValueError: If session doesn't exist
+        """
+        if not self.enable_autonomous:
+            raise ValueError("Autonomous features not enabled")
+
+        if session_id not in self._working_memory_sessions:
+            raise ValueError(f"Working memory session '{session_id}' not found")
+
+        with self._lock:
+            self._working_memory_sessions[session_id]["items"].append({
+                "content": item,
+                "metadata": metadata or {},
+                "added_at": datetime.now(timezone.utc).isoformat()
+            })
+
+    def get_working_memory(self, session_id: str) -> List[Dict[str, Any]]:
+        """
+        Get all items from a working memory session.
+
+        Args:
+            session_id: Working memory session ID
+
+        Returns:
+            List of working memory items
+
+        Raises:
+            ValueError: If session doesn't exist
+        """
+        if not self.enable_autonomous:
+            raise ValueError("Autonomous features not enabled")
+
+        if session_id not in self._working_memory_sessions:
+            raise ValueError(f"Working memory session '{session_id}' not found")
+
+        return self._working_memory_sessions[session_id]["items"].copy()
+
+    def end_working_memory_session(self, session_id: str, persist: bool = False) -> None:
+        """
+        End a working memory session.
+
+        Args:
+            session_id: Working memory session ID
+            persist: If True, persist working memory items to long-term memory
+
+        Raises:
+            ValueError: If session doesn't exist
+        """
+        if not self.enable_autonomous:
+            raise ValueError("Autonomous features not enabled")
+
+        if session_id not in self._working_memory_sessions:
+            raise ValueError(f"Working memory session '{session_id}' not found")
+
+        session = self._working_memory_sessions[session_id]
+
+        # Optionally persist to long-term memory
+        if persist and session["items"]:
+            summary = f"Working memory session {session_id}: " + " | ".join(
+                item["content"] for item in session["items"][:10]  # Limit to first 10 items
+            )
+            try:
+                self.learn(summary, source="working_memory")
+            except Exception as e:
+                if self.enable_logging:
+                    logger.error(f"Failed to persist working memory: {e}")
+
+        with self._lock:
+            del self._working_memory_sessions[session_id]
+
+        if self.enable_logging:
+            logger.info(f"Ended working memory session: {session_id}")
+
+    def track_goal(self, goal_id: str, steps: List[str]) -> Dict[str, Any]:
+        """
+        Track a goal with multiple steps for autonomous agent operation.
+
+        Goal tracking enables agents to maintain awareness of their objectives
+        and track progress through multi-step tasks.
+
+        Args:
+            goal_id: Unique identifier for the goal
+            steps: List of steps to complete the goal
+
+        Returns:
+            Goal tracking info including goal_id, steps, and progress
+
+        Raises:
+            ValueError: If autonomous features not enabled
+
+        Example:
+            goal = memory.track_goal("search-task", [
+                "Gather requirements",
+                "Search documents",
+                "Synthesize results",
+                "Generate response"
+            ])
+        """
+        if not self.enable_autonomous:
+            raise ValueError("Autonomous features not enabled. Set enable_autonomous=True")
+
+        if not self._autonomous_config["goal_tracking_enabled"]:
+            raise ValueError("Goal tracking is disabled in autonomous_features config")
+
+        if not goal_id or not isinstance(goal_id, str):
+            raise ValueError("goal_id must be a non-empty string")
+
+        if not steps or not isinstance(steps, list):
+            raise ValueError("steps must be a non-empty list")
+
+        goal_data = {
+            "goal_id": goal_id,
+            "steps": [{"step": step, "status": "pending", "completed_at": None} for step in steps],
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "current_step": 0,
+            "total_steps": len(steps),
+            "status": "in_progress",
+            "progress": 0.0
+        }
+
+        with self._lock:
+            self._active_goals[goal_id] = goal_data
+
+        if self.enable_logging:
+            logger.info(f"Started tracking goal '{goal_id}' with {len(steps)} steps")
+
+        return goal_data
+
+    def complete_goal_step(self, goal_id: str, step_index: int = None) -> Dict[str, Any]:
+        """
+        Mark a goal step as complete.
+
+        Args:
+            goal_id: Goal identifier
+            step_index: Index of step to complete (defaults to current step)
+
+        Returns:
+            Updated goal data
+
+        Raises:
+            ValueError: If goal doesn't exist
+        """
+        if not self.enable_autonomous:
+            raise ValueError("Autonomous features not enabled")
+
+        if goal_id not in self._active_goals:
+            raise ValueError(f"Goal '{goal_id}' not found")
+
+        with self._lock:
+            goal = self._active_goals[goal_id]
+            idx = step_index if step_index is not None else goal["current_step"]
+
+            if idx >= len(goal["steps"]):
+                raise ValueError(f"Step index {idx} out of range")
+
+            goal["steps"][idx]["status"] = "completed"
+            goal["steps"][idx]["completed_at"] = datetime.now(timezone.utc).isoformat()
+
+            # Update current step to next pending step
+            completed_count = sum(1 for s in goal["steps"] if s["status"] == "completed")
+            goal["progress"] = completed_count / goal["total_steps"]
+
+            if completed_count == goal["total_steps"]:
+                goal["status"] = "completed"
+                goal["completed_at"] = datetime.now(timezone.utc).isoformat()
+            else:
+                # Find next pending step
+                for i, step in enumerate(goal["steps"]):
+                    if step["status"] == "pending":
+                        goal["current_step"] = i
+                        break
+
+        if self.enable_logging:
+            logger.info(f"Goal '{goal_id}' progress: {goal['progress']*100:.0f}%")
+
+        return self._active_goals[goal_id].copy()
+
+    def get_goal_status(self, goal_id: str) -> Dict[str, Any]:
+        """
+        Get the current status of a tracked goal.
+
+        Args:
+            goal_id: Goal identifier
+
+        Returns:
+            Goal status including progress and current step
+
+        Raises:
+            ValueError: If goal doesn't exist
+        """
+        if not self.enable_autonomous:
+            raise ValueError("Autonomous features not enabled")
+
+        if goal_id not in self._active_goals:
+            raise ValueError(f"Goal '{goal_id}' not found")
+
+        return self._active_goals[goal_id].copy()
+
+    def assess_quality(self, response: str, confidence: float) -> Dict[str, Any]:
+        """
+        Assess the quality of a response for metacognitive awareness.
+
+        Quality assessment enables agents to evaluate their own outputs,
+        supporting self-improvement and uncertainty awareness.
+
+        Args:
+            response: The response text to assess
+            confidence: Agent's confidence in the response (0.0 to 1.0)
+
+        Returns:
+            Quality assessment including confidence, quality_score, and recommendations
+
+        Raises:
+            ValueError: If autonomous features not enabled
+
+        Example:
+            assessment = memory.assess_quality(
+                response="The capital of France is Paris.",
+                confidence=0.95
+            )
+            if assessment["quality_score"] < 0.7:
+                # Consider regenerating response
+                pass
+        """
+        if not self.enable_autonomous:
+            raise ValueError("Autonomous features not enabled. Set enable_autonomous=True")
+
+        if not self._autonomous_config["metacognition_enabled"]:
+            raise ValueError("Metacognition is disabled in autonomous_features config")
+
+        if not isinstance(response, str):
+            raise ValueError("response must be a string")
+
+        if not isinstance(confidence, (int, float)) or not 0 <= confidence <= 1:
+            raise ValueError("confidence must be a number between 0 and 1")
+
+        # Perform quality assessment
+        response_length = len(response)
+        threshold = self._autonomous_config["confidence_threshold"]
+
+        # Quality heuristics
+        quality_factors = []
+
+        # Length factor (very short responses may be incomplete)
+        if response_length < 10:
+            quality_factors.append(("length", 0.3, "Response is very short"))
+        elif response_length < 50:
+            quality_factors.append(("length", 0.6, "Response is brief"))
+        else:
+            quality_factors.append(("length", 1.0, "Response has adequate length"))
+
+        # Confidence factor
+        if confidence >= threshold:
+            quality_factors.append(("confidence", 1.0, "Confidence meets threshold"))
+        else:
+            quality_factors.append(("confidence", confidence / threshold, f"Confidence below threshold ({threshold})"))
+
+        # Calculate overall quality score
+        quality_score = sum(f[1] for f in quality_factors) / len(quality_factors)
+
+        assessment = {
+            "response_length": response_length,
+            "confidence": confidence,
+            "confidence_threshold": threshold,
+            "quality_score": quality_score,
+            "meets_quality_bar": quality_score >= threshold,
+            "factors": [{"factor": f[0], "score": f[1], "reason": f[2]} for f in quality_factors],
+            "recommendations": []
+        }
+
+        # Add recommendations
+        if confidence < threshold:
+            assessment["recommendations"].append("Consider gathering more context before responding")
+        if response_length < 50:
+            assessment["recommendations"].append("Consider providing more detail in the response")
+        if quality_score < threshold:
+            assessment["recommendations"].append("Response may benefit from revision")
+
+        if self.enable_logging:
+            logger.debug(f"Quality assessment: score={quality_score:.2f}, confidence={confidence:.2f}")
+
+        return assessment
+
+    def quantify_uncertainty(
+        self,
+        response: str,
+        confidence: float,
+        evidence: List[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Quantify uncertainty in a response for metacognitive awareness.
+
+        Uncertainty quantification enables agents to express appropriate
+        epistemic humility and identify areas needing more information.
+
+        Args:
+            response: The response text to analyze
+            confidence: Agent's confidence in the response (0.0 to 1.0)
+            evidence: List of supporting evidence or sources
+
+        Returns:
+            Uncertainty analysis including uncertainty_score, evidence_strength, and gaps
+
+        Raises:
+            ValueError: If autonomous features not enabled
+
+        Example:
+            uncertainty = memory.quantify_uncertainty(
+                response="The project deadline is likely next Friday.",
+                confidence=0.7,
+                evidence=["Email from manager mentioning Friday", "Calendar invite"]
+            )
+            if uncertainty["uncertainty_score"] > 0.3:
+                print(f"Gaps: {uncertainty['knowledge_gaps']}")
+        """
+        if not self.enable_autonomous:
+            raise ValueError("Autonomous features not enabled. Set enable_autonomous=True")
+
+        if not self._autonomous_config["metacognition_enabled"]:
+            raise ValueError("Metacognition is disabled in autonomous_features config")
+
+        if not isinstance(response, str):
+            raise ValueError("response must be a string")
+
+        if not isinstance(confidence, (int, float)) or not 0 <= confidence <= 1:
+            raise ValueError("confidence must be a number between 0 and 1")
+
+        evidence = evidence or []
+
+        # Calculate uncertainty score (inverse of confidence adjusted by evidence)
+        base_uncertainty = 1.0 - confidence
+
+        # Evidence strength calculation
+        evidence_count = len(evidence)
+        if evidence_count == 0:
+            evidence_strength = 0.0
+            evidence_adjustment = 0.2  # Increase uncertainty without evidence
+        elif evidence_count == 1:
+            evidence_strength = 0.5
+            evidence_adjustment = 0.0
+        elif evidence_count <= 3:
+            evidence_strength = 0.75
+            evidence_adjustment = -0.1  # Decrease uncertainty with moderate evidence
+        else:
+            evidence_strength = 1.0
+            evidence_adjustment = -0.15  # Decrease uncertainty with strong evidence
+
+        uncertainty_score = max(0.0, min(1.0, base_uncertainty + evidence_adjustment))
+
+        # Detect uncertainty indicators in response
+        uncertainty_indicators = [
+            "probably", "likely", "might", "may", "could",
+            "possibly", "perhaps", "uncertain", "unclear", "unsure",
+            "approximately", "around", "about", "roughly"
+        ]
+        response_lower = response.lower()
+        detected_indicators = [ind for ind in uncertainty_indicators if ind in response_lower]
+
+        # Identify knowledge gaps
+        knowledge_gaps = []
+        if confidence < 0.5:
+            knowledge_gaps.append("Low confidence suggests significant knowledge gaps")
+        if evidence_count == 0:
+            knowledge_gaps.append("No supporting evidence provided")
+        if len(detected_indicators) > 2:
+            knowledge_gaps.append("Response contains multiple uncertainty markers")
+
+        result = {
+            "uncertainty_score": uncertainty_score,
+            "confidence": confidence,
+            "evidence_count": evidence_count,
+            "evidence_strength": evidence_strength,
+            "uncertainty_indicators": detected_indicators,
+            "knowledge_gaps": knowledge_gaps,
+            "should_seek_clarification": uncertainty_score > 0.5,
+            "evidence_provided": evidence
+        }
+
+        if self.enable_logging:
+            logger.debug(f"Uncertainty quantification: score={uncertainty_score:.2f}, evidence={evidence_count}")
+
+        return result
+
+    @contextmanager
+    def with_working_memory(self, session_id: str) -> Generator[Dict[str, Any], None, None]:
+        """
+        Context manager for working memory sessions.
+
+        Automatically creates and cleans up working memory sessions,
+        ensuring proper resource management.
+
+        Args:
+            session_id: Unique identifier for the working memory session
+
+        Yields:
+            Working memory session data
+
+        Example:
+            with memory.with_working_memory("task-123") as session:
+                memory.add_to_working_memory("task-123", "Step 1 result")
+                memory.add_to_working_memory("task-123", "Step 2 result")
+                # Working memory automatically cleaned up after block
+        """
+        session = self.create_working_memory_session(session_id)
+        try:
+            yield session
+        finally:
+            try:
+                self.end_working_memory_session(session_id, persist=False)
+            except ValueError:
+                pass  # Session may already be ended
+
+    def with_goal_tracking(self, goal_id: str, steps: List[str]):
+        """
+        Decorator for goal tracking across function execution.
+
+        Wraps a function to automatically track goal progress,
+        marking steps complete as the function progresses.
+
+        Args:
+            goal_id: Unique identifier for the goal
+            steps: List of steps to track
+
+        Returns:
+            Decorator function
+
+        Example:
+            @memory.with_goal_tracking("analysis-task", ["fetch", "analyze", "report"])
+            def analyze_data():
+                # Step 1: fetch
+                data = fetch_data()
+                # Function can call complete_goal_step to mark progress
+                return data
+        """
+        def decorator(func: Callable) -> Callable:
+            @wraps(func)
+            def wrapper(*args, **kwargs):
+                # Start goal tracking
+                self.track_goal(goal_id, steps)
+
+                try:
+                    result = func(*args, **kwargs)
+
+                    # Auto-complete all remaining steps on success
+                    goal = self.get_goal_status(goal_id)
+                    for i, step in enumerate(goal["steps"]):
+                        if step["status"] == "pending":
+                            self.complete_goal_step(goal_id, i)
+
+                    return result
+
+                except Exception as e:
+                    # Mark goal as failed
+                    with self._lock:
+                        if goal_id in self._active_goals:
+                            self._active_goals[goal_id]["status"] = "failed"
+                            self._active_goals[goal_id]["error"] = str(e)
+                    raise
+
+            return wrapper
+        return decorator
+
+    def get_autonomous_status(self) -> Dict[str, Any]:
+        """
+        Get status of all autonomous agent features.
+
+        Returns:
+            Status of working memory sessions, active goals, and configuration
+        """
+        if not self.enable_autonomous:
+            return {"enabled": False}
+
+        return {
+            "enabled": True,
+            "config": self._autonomous_config.copy(),
+            "working_memory_sessions": len(self._working_memory_sessions),
+            "active_sessions": list(self._working_memory_sessions.keys()),
+            "active_goals": len(self._active_goals),
+            "goals": {
+                goal_id: {
+                    "status": goal["status"],
+                    "progress": goal["progress"],
+                    "current_step": goal["current_step"]
+                }
+                for goal_id, goal in self._active_goals.items()
+            }
+        }

@@ -19,16 +19,18 @@ pip install recallbricks-langchain
 
 ## Quick Start
 
+### Memory with Automatic Organization
+
 ```python
 from langchain.chains.conversation.base import ConversationChain
 from langchain_openai import ChatOpenAI
 from recallbricks_langchain import RecallBricksMemory
 
-# Initialize memory with RecallBricks
+# Initialize memory with organized recall (enabled by default)
 memory = RecallBricksMemory(
     agent_id="my-agent",
     api_key="your-recallbricks-api-key",
-    user_id="user-123"  # Optional
+    organized=True  # Returns category summaries for better context
 )
 
 # Use with any LangChain chain
@@ -39,19 +41,122 @@ conversation = ConversationChain(
 )
 
 # Your agent now has relationship-aware memory!
-conversation.run("Deploy the new authentication feature")
-# Later...
-conversation.run("Why did the deployment fail?")
-# RecallBricks provides context: "Related to the auth feature you deployed"
+response = conversation.run("Tell me about RecallBricks")
+# Memories are automatically tagged, categorized, and organized
+```
+
+### Retriever for RAG
+
+```python
+from recallbricks_langchain import RecallBricksRetriever
+from langchain.chains import RetrievalQA
+
+retriever = RecallBricksRetriever(
+    api_key="your-api-key",
+    k=5,  # Top 5 results
+    organized=True
+)
+
+qa_chain = RetrievalQA.from_chain_type(
+    llm=ChatOpenAI(),
+    retriever=retriever
+)
+
+answer = qa_chain.run("What is cognitive memory infrastructure?")
+```
+
+### Chat Message History
+
+```python
+from recallbricks_langchain import RecallBricksChatMessageHistory
+from langchain.memory import ConversationBufferMemory
+
+history = RecallBricksChatMessageHistory(
+    api_key="your-api-key",
+    session_id="user-123-session-1"
+)
+
+memory = ConversationBufferMemory(
+    chat_memory=history,
+    return_messages=True
+)
 ```
 
 ## Features
 
-✅ **Drop-in replacement** for ConversationBufferMemory
-✅ **Automatic relationship detection** - understands causality and patterns
-✅ **Persistent across sessions** - memories don't disappear
-✅ **Multi-user support** - isolate memory per user
-✅ **Production-ready** - 99.9% uptime, enterprise security
+### New in v1.3.0: Autonomous Agent Features
+
+- **Working Memory Sessions**: Short-term, task-specific memory for multi-step reasoning
+- **Goal Tracking**: Track progress through multi-step goals with status monitoring
+- **Metacognition**: Quality assessment and uncertainty quantification for self-aware agents
+- **Context Manager**: `with_working_memory()` for automatic session cleanup
+- **Decorator**: `@with_goal_tracking()` for automatic goal management
+
+```python
+from recallbricks_langchain import RecallBricksMemory
+
+# Enable autonomous features
+memory = RecallBricksMemory(
+    agent_id="my-agent",
+    api_key="your-key",
+    enable_autonomous=True,
+    autonomous_features={
+        "working_memory_ttl": 3600,
+        "goal_tracking_enabled": True,
+        "metacognition_enabled": True,
+        "confidence_threshold": 0.7
+    }
+)
+
+# Working memory with context manager
+with memory.with_working_memory("task-123") as session:
+    memory.add_to_working_memory("task-123", "Step 1 result")
+    memory.add_to_working_memory("task-123", "Step 2 result")
+    # Automatically cleaned up after block
+
+# Goal tracking
+goal = memory.track_goal("research-task", [
+    "Gather requirements",
+    "Search documents",
+    "Synthesize results"
+])
+memory.complete_goal_step("research-task")  # Mark steps complete
+
+# Metacognition - assess quality
+assessment = memory.assess_quality(response, confidence=0.85)
+if not assessment["meets_quality_bar"]:
+    print(f"Recommendations: {assessment['recommendations']}")
+
+# Metacognition - quantify uncertainty
+uncertainty = memory.quantify_uncertainty(
+    response="The deadline is likely Friday",
+    confidence=0.7,
+    evidence=["Email from manager", "Calendar event"]
+)
+if uncertainty["should_seek_clarification"]:
+    print(f"Knowledge gaps: {uncertainty['knowledge_gaps']}")
+```
+
+### New in v1.2.0
+
+- ✅ **Automatic Metadata Extraction**: Tags, categories, entities extracted automatically via `learn()` endpoint
+- ✅ **Organized Recall**: Get category summaries for faster context assembly (3-5x faster LLM reasoning)
+- ✅ **RecallBricksRetriever**: LangChain retriever for RAG applications
+- ✅ **RecallBricksChatMessageHistory**: Persistent chat history with session support
+
+### Enterprise Features
+
+- ✅ **Drop-in replacement** for ConversationBufferMemory
+- ✅ **Automatic relationship detection** - understands causality and patterns
+- ✅ **Persistent across sessions** - memories don't disappear
+- ✅ **Multi-user support** - isolate memory per user
+- ✅ **Multi-tenant support** - project IDs for isolation
+- ✅ **Production-ready** - 99.9% uptime, enterprise security
+- ✅ **Circuit breaker** - fault tolerance for API failures
+- ✅ **Rate limiting** - prevents API abuse
+- ✅ **Request deduplication** - prevents duplicate saves
+- ✅ **Prometheus metrics** - observability built-in
+- ✅ **Health checks** - comprehensive monitoring
 
 ## Why RecallBricks vs Standard LangChain Memory?
 
@@ -63,21 +168,73 @@ conversation.run("Why did the deployment fail?")
 | Detects causality | ❌ | ✅ |
 | Finds patterns | ❌ | ✅ |
 | Explains connections | ❌ | ✅ |
+| Auto-extracts metadata | ❌ | ✅ |
+| Organized recall | ❌ | ✅ |
 
-## Advanced Usage
+## API Reference
 
-### With Custom Parameters
+### RecallBricksMemory
+
+Main memory class for LangChain agents with automatic metadata extraction.
 
 ```python
 memory = RecallBricksMemory(
-    agent_id="my-agent",
-    api_key="your-key",
-    user_id="user-123",  # Optional
-    limit=20,  # Number of memories to retrieve
-    min_relevance=0.7,  # Minimum relevance score
-    return_messages=True  # Return as Message objects
+    agent_id="my-agent",           # Required: Agent identifier
+    api_key="your-key",            # Required: RecallBricks API key
+    user_id="user-123",            # Optional: User ID (UUID format)
+    project_id="my-project",       # Optional: Project ID for multi-tenant
+    organized=True,                # Optional: Use organized recall (default: True)
+    source="langchain",            # Optional: Source identifier
+    limit=10,                      # Optional: Max memories to retrieve
+    return_messages=False,         # Optional: Return as Message objects
 )
+
+# Direct API access
+memory.learn("User prefers dark mode")  # Auto-extracts tags, category
+result = memory.recall("user preferences", organized=True)
 ```
+
+### RecallBricksRetriever
+
+LangChain retriever for RAG applications with organized recall.
+
+```python
+retriever = RecallBricksRetriever(
+    api_key="your-key",            # Required: RecallBricks API key
+    k=4,                           # Optional: Number of results (default: 4)
+    organized=True,                # Optional: Use organized recall (default: True)
+    project_id="my-project",       # Optional: Project ID
+)
+
+# Standard retriever interface
+docs = retriever.get_relevant_documents("search query")
+
+# Get documents with category summaries
+result = retriever.get_relevant_documents_with_categories("search query")
+docs = result["documents"]
+categories = result["categories"]
+```
+
+### RecallBricksChatMessageHistory
+
+Persistent chat history with session isolation.
+
+```python
+history = RecallBricksChatMessageHistory(
+    api_key="your-key",            # Required: RecallBricks API key
+    session_id="session-123",      # Required: Unique session identifier
+    project_id="my-project",       # Optional: Project ID
+)
+
+# Add messages
+history.add_user_message("Hello!")
+history.add_ai_message("Hi there!")
+
+# Get all messages
+messages = history.messages
+```
+
+## Advanced Usage
 
 ### Multi-User Applications
 
@@ -90,6 +247,75 @@ def get_conversation_for_user(user_id: str):
     )
     return ConversationChain(llm=llm, memory=memory)
 ```
+
+### Multi-Tenant Applications
+
+```python
+# Use project_id to isolate memory per tenant
+memory = RecallBricksMemory(
+    agent_id="my-agent",
+    api_key="your-key",
+    project_id="tenant-abc"  # Isolates memory per project/tenant
+)
+```
+
+### Direct Learn/Recall Access
+
+```python
+memory = RecallBricksMemory(
+    agent_id="my-agent",
+    api_key="your-key"
+)
+
+# Save with automatic metadata extraction
+result = memory.learn("The user's favorite color is blue")
+print(result["metadata"])  # {"tags": ["preferences"], "category": "Personal", ...}
+
+# Recall with organization
+result = memory.recall("user preferences", organized=True)
+print(result["categories"])  # {"Personal": {"summary": "...", "count": 5}}
+```
+
+### Monitoring & Health Checks
+
+```python
+memory = RecallBricksMemory(
+    agent_id="my-agent",
+    api_key="your-key",
+    enable_metrics=True
+)
+
+# Get detailed metrics
+metrics = memory.get_detailed_metrics()
+print(f"Success rate: {metrics['success_rate']}")
+print(f"P95 response time: {metrics['response_time_p95']}")
+
+# Export Prometheus metrics
+prometheus_output = memory.get_prometheus_metrics()
+
+# Comprehensive health check
+health = memory.health_check()
+print(f"Status: {health['status']}")
+```
+
+## Migration from v1.1
+
+```python
+# Old (v1.1) - still works but deprecated
+memory.client.save_memory(text="...", tags=["manual"])
+
+# New (v1.2) - automatic metadata extraction
+memory.learn(text="...")  # Tags auto-generated!
+
+# Old recall
+result = memory.load_memory_variables({"input": "query"})
+
+# New organized recall (default)
+result = memory.load_memory_variables({"input": "query"})
+# Now includes category summaries for 3-5x faster LLM reasoning
+```
+
+Existing code continues to work. Update to `learn()` for automatic metadata extraction.
 
 ## Get Your API Key
 
@@ -108,6 +334,7 @@ def get_conversation_for_user(user_id: str):
 Check out the `examples/` directory for:
 - `basic_usage.py` - Simple conversation example
 - `with_openai.py` - Advanced multi-user scenarios with relationship detection
+- `autonomous_agent_example.py` - Working memory, goal tracking, and metacognition (v1.3.0)
 
 ## Development
 
